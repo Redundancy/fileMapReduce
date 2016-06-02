@@ -2,6 +2,7 @@ package mapreduce
 
 import (
 	"bytes"
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
@@ -89,6 +90,14 @@ func singleResult(r interface{}) []MapResult {
 	return []MapResult{MapResult{Result: r}}
 }
 
+var nilMapper = func(path string, data []byte) ([]MapResult, error) {
+	return singleResult(nil), nil
+}
+
+var nilFinalizer = func(result interface{}) error {
+	return nil
+}
+
 func TestLineCounter(t *testing.T) {
 	fs := &FS{Root: "testFixtures"}
 
@@ -165,5 +174,96 @@ func TestLineSum(t *testing.T) {
 
 	if finalValue != 195 {
 		t.Error("Unexpected final value", finalValue)
+	}
+}
+
+type FSError struct {
+	FS
+}
+
+var errfileSystemOpenFailed = errors.New("TEST FAIL")
+
+func (f *FSError) Open(path string) (contents []byte, err error) {
+	return nil, errfileSystemOpenFailed
+}
+
+func TestFileSystemError(t *testing.T) {
+	fs := &FSError{FS{Root: "testFixtures"}}
+
+	var m FunctionMapper = func(path string, data []byte) ([]MapResult, error) {
+		return singleResult(nil), nil
+	}
+
+	var f FunctionFinalizer = func(result interface{}) error {
+		return nil
+	}
+
+	err := MapReduce(fs, []Job{
+		Job{
+			Name:      "TestFileSystemError",
+			Filter:    PathFilter("**/*.txt"),
+			Mapper:    m,
+			Reducer:   FunctionReducer(sumInt),
+			Finalizer: f,
+		},
+	})
+
+	if err != errfileSystemOpenFailed {
+		t.Error("Expected the file system error!")
+	}
+}
+
+var errMapper = errors.New("TEST FAIL: errMapper")
+
+func TestMapperError(t *testing.T) {
+	fs := &FS{Root: "testFixtures"}
+
+	var m FunctionMapper = func(path string, data []byte) ([]MapResult, error) {
+		return singleResult(nil), errMapper
+	}
+
+	var f FunctionFinalizer = func(result interface{}) error {
+		return nil
+	}
+
+	err := MapReduce(fs, []Job{
+		Job{
+			Name:      "TestMapperError",
+			Filter:    PathFilter("**/*.txt"),
+			Mapper:    m,
+			Reducer:   FunctionReducer(sumInt),
+			Finalizer: f,
+		},
+	})
+
+	if err != errMapper {
+		t.Error("Expected the file system error!")
+	}
+}
+
+var errReducer = errors.New("TEST FAIL: errReducer")
+
+func TestReducerError(t *testing.T) {
+	fs := &FS{Root: "testFixtures"}
+
+	var m FunctionMapper = nilMapper
+	var f FunctionFinalizer = nilFinalizer
+
+	var r FunctionReducer = func(current interface{}, stream chan []MapResult) (result interface{}, err error) {
+		return nil, errReducer
+	}
+
+	err := MapReduce(fs, []Job{
+		Job{
+			Name:      "TestReducerError",
+			Filter:    PathFilter("**/*.txt"),
+			Mapper:    m,
+			Reducer:   r,
+			Finalizer: f,
+		},
+	})
+
+	if err != errReducer {
+		t.Errorf("Expected the file system error! Got: %#v", err)
 	}
 }

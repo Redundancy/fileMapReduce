@@ -26,81 +26,9 @@ type Job struct {
 	jobIndex int
 }
 
-// Filter is mechanism for filtering files and directories as we recursively descend
-type Filter interface {
-	// CouldMatch indicates that a directory path could match the filter in the future
-	CouldMatch(string) bool
-
-	// Match indicates an actual match with a file
-	Match(string) bool
-}
-
-// Mapper provides an interface to execute map operations on files
-type Mapper interface {
-	Map(path string, data []byte) ([]MapResult, error)
-}
-
-// Sorter (if provided as part of a Job) will ensure that each invocation of
-// Reduce receives items in sorted order
-type Sorter interface {
-	Less(o *MapResult, than *MapResult) bool
-}
-
-// FunctionMapper implements the Mapper interface with a simple function
-type FunctionMapper func(path string, data []byte) ([]MapResult, error)
-
-// Map implements Mapper.Map
-func (f FunctionMapper) Map(path string, data []byte) ([]MapResult, error) {
-	return f(path, data)
-}
-
-// Reducer can be understood in terms of traditional MapReduce concepts
-// it is a function that can be invoked many times, sometimes with existing reduced output as an initial state
-type Reducer interface {
-	// Reduce is called with nil current when input is straight from the mapper
-	// You can assume that stream is sorted in terms of the key if a Sorter is provided
-	Reduce(current interface{}, stream chan []MapResult) (result interface{}, err error)
-}
-
-// FunctionReducer implements the Reducer interface with a simple function
-type FunctionReducer func(current interface{}, stream chan []MapResult) (result interface{}, err error)
-
-// Reduce implements Reducer.Reduce
-func (f FunctionReducer) Reduce(current interface{}, stream chan []MapResult) (result interface{}, err error) {
-	return f(current, stream)
-}
-
-// Finalizer takes the result of the final reduction and does whatever a job needs to do with it
-//
-type Finalizer interface {
-	Finish(result interface{}) error
-}
-
-// FunctionFinalizer provides a way to implement a Finalizer with a function
-type FunctionFinalizer func(result interface{}) error
-
-// Finish from Finalizer
-func (f FunctionFinalizer) Finish(result interface{}) error {
-	return f(result)
-}
-
-// MapResult represents a single result
-//
-type MapResult struct {
-	// An optional Sort key
-	Key    int64
-	Result interface{}
-}
-
-// FileSystem implements a simple disk-based file system interface
-type FileSystem interface {
-	List(path string) (folders []string, files []string, err error)
-	Open(path string) (contents []byte, err error)
-}
-
 // MapReduce takes a list of Jobs and executes them concurrently on
 // a FileSystem
-func MapReduce(filesystem FileSystem, jobs Jobs) error {
+func MapReduce(filesystem FileSystem, jobs Jobs) (err error) {
 	foldersRemaining := &workRemaining{}
 	foldersRemaining.Add(folderToMap{jobs, ""})
 
@@ -110,36 +38,83 @@ func MapReduce(filesystem FileSystem, jobs Jobs) error {
 		jobWorkResult[i] = make(chan mappingWorkResult)
 	}
 
-	reducerInputs, errorChannel := startReducers(jobs)
-	hasFinished := false
-
-	mapperWaitGroup := sync.WaitGroup{}
-	mapperInput := make(chan mappingWork)
-	for i := 0; i < runtime.NumCPU(); i++ {
-		go mappingApplier(mapperInput)
-	}
-
-	doneMapping := func() {
-		if !hasFinished {
-			close(mapperInput)
-			mapperWaitGroup.Wait()
-			for _, d := range reducerInputs {
-				close(d)
-			}
-			hasFinished = true
+	// stop is the gordian knot used to break all deadlocks
+	// all sends are done as selects against this channel, allowing them to
+	// drain when it is closed
+	stop := make(chan struct{})
+	stopped := false
+	stopNow := func() {
+		if !stopped {
+			close(stop)
+			stopped = true
 		}
 	}
-	defer doneMapping()
+	defer stopNow()
+	// All blocking sends and receives on the main channel must listen to the
+	// error channel. Only the first error is received from it
+	errorChannel := make(chan error)
+
+	reducerWaitGroup := sync.WaitGroup{}
+	mapperWaitGroup := sync.WaitGroup{}
+	ioWaitGroup := sync.WaitGroup{}
+
+	fileOpenRequests := make(chan fileOpenRequest, 2*runtime.NumCPU())
+	mapperInput := make(chan mappingWork)
+	reducerInputs := startReducers(
+		jobs,
+		stop,
+		errorChannel,
+		&reducerWaitGroup,
+	)
+
+	numCPU := runtime.NumCPU()
+	ioWaitGroup.Add(numCPU)
+	mapperWaitGroup.Add(numCPU)
+
+	for i := 0; i < numCPU; i++ {
+		go fileOpener(
+			filesystem,
+			fileOpenRequests,
+			mapperInput,
+			errorChannel,
+			stop,
+			&ioWaitGroup,
+			&mapperWaitGroup,
+		)
+
+		go mappingApplier(
+			mapperInput,
+			stop,
+			&mapperWaitGroup,
+		)
+	}
+
+	defer func() {
+		// shut down the pipline in order
+		close(fileOpenRequests)
+		ioWaitGroup.Wait()
+		// done reading files and feeding the mapper
+
+		close(mapperInput)
+		mapperWaitGroup.Wait()
+		// mappers done feeding reducers
+
+		for _, d := range reducerInputs {
+			close(d)
+		}
+
+		reducerWaitGroup.Wait()
+	}()
 
 	for !foldersRemaining.Done() {
 		currentFolder, _ := foldersRemaining.Pop()
-		folders, files, err := filesystem.List(currentFolder.Path)
+		folders, files, listErr := filesystem.List(currentFolder.Path)
 
-		if err != nil {
-			return err
+		if listErr != nil {
+			return listErr
 		}
 
-		addSubfoldersToRemamingWork(
+		addSubfoldersToRemainingWork(
 			foldersRemaining,
 			currentFolder,
 			folders,
@@ -154,37 +129,37 @@ func MapReduce(filesystem FileSystem, jobs Jobs) error {
 				continue FileMapping
 			}
 
-			// Open once
-			content, err := filesystem.Open(fullpath)
-			if err != nil {
-				return &fileOpenError{
-					path: fullpath,
-					jobs: applicableJobs.Names(),
-					err:  err,
+			mappers := make([]mappingWork, len(applicableJobs))
+			for i, job := range applicableJobs {
+				mappers[i] = mappingWork{
+					m:      job,
+					path:   fullpath,
+					result: jobWorkResult[i],
 				}
 			}
 
+			fileOpenRequests <- fileOpenRequest{
+				path: fullpath,
+				work: mappers,
+			}
+
+			// TODO: Let the mappers feed the reducers directly
 			for i, job := range applicableJobs {
-				mapperWaitGroup.Add(1)
-				mapperInput <- mappingWork{
-					m:       job,
-					path:    fullpath,
-					content: content,
-					result:  jobWorkResult[i],
-					waiter:  &mapperWaitGroup,
+				var res mappingWorkResult
+
+				select {
+				case res = <-jobWorkResult[i]:
+				case err = <-errorChannel:
+					stopNow()
+					return err
 				}
-			} // TODO: move the reducer input to the goroutine
 
-			for i, job := range applicableJobs {
-				res := <-jobWorkResult[i]
-				results, err := res.results, res.err
+				results, resultErr := res.results, res.err
 
-				if err != nil {
-					return &mappingError{
-						path: fullpath,
-						job:  job.Name,
-						err:  err,
-					}
+				if resultErr != nil {
+					err = resultErr
+					stopNow()
+					return err
 				}
 
 				if len(results) > 1 && job.Sorter != nil {
@@ -199,25 +174,49 @@ func MapReduce(filesystem FileSystem, jobs Jobs) error {
 		}
 	}
 
-	doneMapping()
+	return err
+}
 
-	var err error
+type fileOpenRequest struct {
+	path string
+	work []mappingWork
+}
 
-	// Wait for all reducers to finish
-	for i := range jobs {
-		if jobs[i].Reducer == nil {
-			continue
+func fileOpener(
+	fs FileSystem,
+	inputChan <-chan fileOpenRequest,
+	outputChan chan<- mappingWork,
+	errChan chan<- error,
+	stop <-chan struct{},
+	fileWaitGroup *sync.WaitGroup,
+	mapperWaitGroup *sync.WaitGroup,
+) {
+	defer fileWaitGroup.Done()
+
+	for i := range inputChan {
+		content, err := fs.Open(i.path)
+
+		if err != nil {
+			select {
+			case <-stop:
+				return
+			case errChan <- err:
+				return
+			}
 		}
 
-		if err == nil {
-			err = <-errorChannel
-		} else {
-			// ignore further errors
-			<-errorChannel
+		for _, work := range i.work {
+			work.content = content
+
+			// don't block in case stopped
+			select {
+			case <-stop:
+				return
+			case outputChan <- work:
+			}
+
 		}
 	}
-
-	return err
 }
 
 type mappingWorkResult struct {
@@ -230,18 +229,22 @@ type mappingWork struct {
 	path    string
 	content []byte
 	result  chan<- mappingWorkResult
-	waiter  *sync.WaitGroup
 }
 
-func (w mappingWork) Apply() {
-	r, err := w.m.Map(w.path, w.content)
-	w.result <- mappingWorkResult{r, err}
-	w.waiter.Done()
-}
+func mappingApplier(
+	workChan chan mappingWork,
+	stop <-chan struct{},
+	waiter *sync.WaitGroup,
+) {
+	defer waiter.Done()
 
-func mappingApplier(workChan chan mappingWork) {
 	for work := range workChan {
-		work.Apply()
+		r, err := work.m.Map(work.path, work.content)
+		select {
+		case <-stop:
+			return
+		case work.result <- mappingWorkResult{r, err}:
+		}
 	}
 }
 
@@ -270,7 +273,7 @@ func (w *workRemaining) Pop() (folderToMap, bool) {
 	return popped, true
 }
 
-func addSubfoldersToRemamingWork(work *workRemaining, currentFolder folderToMap, folders []string) {
+func addSubfoldersToRemainingWork(work *workRemaining, currentFolder folderToMap, folders []string) {
 	for _, folder := range folders {
 		subfolder := joinWithSlash(currentFolder.Path, folder)
 		potentialJobsForSubfolder := currentFolder.Jobs.Potential(subfolder)
@@ -284,41 +287,58 @@ func addSubfoldersToRemamingWork(work *workRemaining, currentFolder folderToMap,
 	}
 }
 
-func startReducers(jobs Jobs) (dispatchers []chan<- []MapResult, errors <-chan error) {
+func startReducers(
+	jobs Jobs,
+	stop <-chan struct{},
+	errorChannel chan<- error,
+	wg *sync.WaitGroup,
+) (dispatchers []chan<- []MapResult) {
 	// for each job, create a dispatcher channel
 	dispatchers = make([]chan<- []MapResult, len(jobs))
-	errorChannel := make(chan error)
-
-	handlers := make([]chan []MapResult, len(jobs))
 
 	for i := range jobs {
 		resultChannel := make(chan []MapResult, 5)
-		handlers[i], dispatchers[i] = resultChannel, resultChannel
+		dispatchers[i] = resultChannel
 
 		job := jobs[i]
 		reducerFunc := job.Reducer
 
 		if reducerFunc != nil {
-			go reduceAndFinalize(job, resultChannel, errorChannel)
+			wg.Add(1)
+			go reduceAndFinalize(
+				job,
+				resultChannel,
+				stop,
+				errorChannel,
+				wg,
+			)
 		}
 	}
 
-	return dispatchers, errorChannel
+	return dispatchers
 }
 
-func reduceAndFinalize(job Job, resultChannel chan []MapResult, errorChannel chan<- error) {
+func reduceAndFinalize(
+	job Job,
+	resultChannel chan []MapResult,
+	stop <-chan struct{},
+	errorChannel chan<- error,
+	wg *sync.WaitGroup,
+) {
 	result, err := job.Reducer.Reduce(nil, resultChannel)
 
+	if err == nil && job.Finalizer != nil {
+		err = job.Finalizer.Finish(result)
+	}
+
 	if err != nil {
-		errorChannel <- err
+		select {
+		case <-stop:
+		case errorChannel <- err:
+		}
 	}
 
-	if job.Finalizer != nil {
-		errorChannel <- job.Finalizer.Finish(result)
-		return
-	}
-
-	errorChannel <- nil
+	wg.Done()
 }
 
 // Jobs are a list of Jobs
