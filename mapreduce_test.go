@@ -3,6 +3,8 @@ package mapreduce
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -208,8 +210,8 @@ func TestFileSystemError(t *testing.T) {
 		},
 	})
 
-	if err != errfileSystemOpenFailed {
-		t.Error("Expected the file system error!")
+	if err == nil {
+		t.Errorf("Expected an error!")
 	}
 }
 
@@ -265,5 +267,88 @@ func TestReducerError(t *testing.T) {
 
 	if err != errReducer {
 		t.Errorf("Expected the file system error! Got: %#v", err)
+	}
+}
+
+func TestSortedReduction(t *testing.T) {
+	fs := &FS{Root: "testFixtures"}
+
+	var m FunctionMapper = func(path string, data []byte) ([]MapResult, error) {
+		return []MapResult{
+			MapResult{Key: 3},
+			MapResult{Key: 1},
+			MapResult{Key: 2},
+		}, nil
+	}
+
+	var r FunctionReducer = func(current interface{}, stream chan []MapResult) (result interface{}, err error) {
+		for items := range stream {
+			if !sort.IsSorted(&resultSorter{items, SimpleLess}) {
+				err = fmt.Errorf("Unsorted items: %#v", items)
+			}
+		}
+		return nil, err
+	}
+
+	var f FunctionFinalizer = nilFinalizer
+
+	err := MapReduce(fs, []Job{
+		Job{
+			Name:      "TestSortedReduction",
+			BatchSize: 3,
+			Filter:    PathFilter("**/*.txt"),
+			Mapper:    m,
+			Sorter:    SimpleLess,
+			Reducer:   r,
+			Finalizer: f,
+		},
+	})
+
+	if err != nil {
+		t.Error(err)
+	}
+}
+
+func TestBatching(t *testing.T) {
+	fs := &FS{Root: "testFixtures"}
+
+	// invoked three times (9 results)
+	var m FunctionMapper = func(path string, data []byte) ([]MapResult, error) {
+		return []MapResult{
+			MapResult{Key: 3},
+			MapResult{Key: 1},
+			MapResult{Key: 2},
+		}, nil
+	}
+
+	var r FunctionReducer = func(current interface{}, stream chan []MapResult) (result interface{}, err error) {
+		i := 0
+		for items := range stream {
+			i++
+			if i == 1 && len(items) != 5 {
+				err = fmt.Errorf("Expected 5 items in first batch %#v", items)
+			} else if i == 2 && len(items) != 4 {
+				err = fmt.Errorf("Expected 4 items in second batch: %#v", items)
+			}
+		}
+		return nil, err
+	}
+
+	var f FunctionFinalizer = nilFinalizer
+
+	err := MapReduce(fs, []Job{
+		Job{
+			Name:      "TestSortedReduction",
+			BatchSize: 5,
+			Filter:    PathFilter("**/*.txt"),
+			Mapper:    m,
+			Sorter:    SimpleLess,
+			Reducer:   r,
+			Finalizer: f,
+		},
+	})
+
+	if err != nil {
+		t.Error(err)
 	}
 }

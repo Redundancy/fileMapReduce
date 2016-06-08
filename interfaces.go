@@ -14,12 +14,6 @@ type Mapper interface {
 	Map(path string, data []byte) ([]MapResult, error)
 }
 
-// Sorter (if provided as part of a Job) will ensure that each invocation of
-// Reduce receives items in sorted order
-type Sorter interface {
-	Less(o *MapResult, than *MapResult) bool
-}
-
 // FunctionMapper implements the Mapper interface with a simple function
 type FunctionMapper func(path string, data []byte) ([]MapResult, error)
 
@@ -27,6 +21,27 @@ type FunctionMapper func(path string, data []byte) ([]MapResult, error)
 func (f FunctionMapper) Map(path string, data []byte) ([]MapResult, error) {
 	return f(path, data)
 }
+
+// Sorter (if provided as part of a Job) will ensure that each invocation of
+// Reduce receives items in sorted order
+type Sorter interface {
+	Less(o *MapResult, than *MapResult) bool
+}
+
+// FunctionSorter implements Sorter for a function
+type FunctionSorter func(o *MapResult, than *MapResult) bool
+
+// Less implements Sorter.Less
+func (f FunctionSorter) Less(o *MapResult, than *MapResult) bool {
+	return f(o, than)
+}
+
+func simpleLess(o *MapResult, than *MapResult) bool {
+	return o.Key < than.Key
+}
+
+// SimpleLess implements a default sorting (ascending)
+var SimpleLess = FunctionSorter(simpleLess)
 
 // Reducer can be understood in terms of traditional MapReduce concepts
 // it is a function that can be invoked many times, sometimes with existing reduced output as an initial state

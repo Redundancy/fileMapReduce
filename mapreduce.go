@@ -1,62 +1,39 @@
 package mapreduce
 
 import (
-	"fmt"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"sync"
 )
 
-// Job is a single unit of work to produce a single output during a map reduce process
-// MapReduce takes multiple jobs and runs them concurrently on the set of files
-// ensuring that files are only opened once per MapReduce, rather than once per job
-//
-// Each Job has an identifying name, and a Filter that chooses what files it will operate on
-// Each matching file will be passed to a Mapper which
-type Job struct {
-	Name      string
-	BatchSize uint
-	Filter
-	Mapper
-	Sorter
-	Reducer
-	Finalizer
-
-	jobIndex int
-}
-
 // MapReduce takes a list of Jobs and executes them concurrently on
 // a FileSystem
 func MapReduce(filesystem FileSystem, jobs Jobs) (err error) {
 	foldersRemaining := &workRemaining{}
-	foldersRemaining.Add(folderToMap{jobs, ""})
+	foldersRemaining.Add(folderToMap{Path: "", Jobs: jobs})
 
-	jobWorkResult := make([]chan mappingWorkResult, len(jobs))
+	jobWorkResult := make([]chan []MapResult, len(jobs))
 	for i := range jobs {
 		jobs[i].jobIndex = i
-		jobWorkResult[i] = make(chan mappingWorkResult)
+		jobWorkResult[i] = make(chan []MapResult)
 	}
 
 	// stop is the gordian knot used to break all deadlocks
 	// all sends are done as selects against this channel, allowing them to
 	// drain when it is closed
 	stop := make(chan struct{})
-	stopped := false
-	stopNow := func() {
-		if !stopped {
-			close(stop)
-			stopped = true
-		}
-	}
+	stopNow := (&once{f: func() { close(stop) }}).Do
+
 	defer stopNow()
 	// All blocking sends and receives on the main channel must listen to the
 	// error channel. Only the first error is received from it
 	errorChannel := make(chan error)
 
-	reducerWaitGroup := sync.WaitGroup{}
-	mapperWaitGroup := sync.WaitGroup{}
 	ioWaitGroup := sync.WaitGroup{}
+	mapperWaitGroup := sync.WaitGroup{}
+	aggregatorWaitGroup := sync.WaitGroup{}
+	reducerWaitGroup := sync.WaitGroup{}
 
 	fileOpenRequests := make(chan fileOpenRequest, 2*runtime.NumCPU())
 	mapperInput := make(chan mappingWork)
@@ -79,7 +56,6 @@ func MapReduce(filesystem FileSystem, jobs Jobs) (err error) {
 			errorChannel,
 			stop,
 			&ioWaitGroup,
-			&mapperWaitGroup,
 		)
 
 		go mappingApplier(
@@ -89,23 +65,51 @@ func MapReduce(filesystem FileSystem, jobs Jobs) (err error) {
 		)
 	}
 
-	defer func() {
-		// shut down the pipline in order
-		close(fileOpenRequests)
+	for _, job := range jobs {
+		aggregatorWaitGroup.Add(1)
+		go aggregator(
+			jobWorkResult[job.jobIndex],
+			job.BatchSize,
+			reducerInputs[job.jobIndex],
+			stop,
+			job.Sorter,
+			&aggregatorWaitGroup,
+		)
+	}
+
+	inputDone := false
+	done := make(chan struct{})
+
+	shutdown := (&once{f: func() {
+		// shut down the pipline from front to back,
+		// to give everything a chance to clear
+		if !inputDone {
+			close(fileOpenRequests)
+		}
+
 		ioWaitGroup.Wait()
 		// done reading files and feeding the mapper
 
 		close(mapperInput)
 		mapperWaitGroup.Wait()
-		// mappers done feeding reducers
+		// mappers done feeding aggregators
+
+		for _, d := range jobWorkResult {
+			close(d)
+		}
+
+		aggregatorWaitGroup.Wait()
+		// aggregators done feeding reducers
 
 		for _, d := range reducerInputs {
 			close(d)
 		}
 
 		reducerWaitGroup.Wait()
-	}()
+		close(done)
+	}}).Do
 
+	defer shutdown()
 	for !foldersRemaining.Done() {
 		currentFolder, _ := foldersRemaining.Pop()
 		folders, files, listErr := filesystem.List(currentFolder.Path)
@@ -114,8 +118,7 @@ func MapReduce(filesystem FileSystem, jobs Jobs) (err error) {
 			return listErr
 		}
 
-		addSubfoldersToRemainingWork(
-			foldersRemaining,
+		foldersRemaining.addSubfoldersToRemainingWork(
 			currentFolder,
 			folders,
 		)
@@ -132,9 +135,10 @@ func MapReduce(filesystem FileSystem, jobs Jobs) (err error) {
 			mappers := make([]mappingWork, len(applicableJobs))
 			for i, job := range applicableJobs {
 				mappers[i] = mappingWork{
-					m:      job,
-					path:   fullpath,
-					result: jobWorkResult[i],
+					m:         job,
+					path:      fullpath,
+					result:    jobWorkResult[i],
+					errorChan: errorChannel,
 				}
 			}
 
@@ -142,39 +146,24 @@ func MapReduce(filesystem FileSystem, jobs Jobs) (err error) {
 				path: fullpath,
 				work: mappers,
 			}
-
-			// TODO: Let the mappers feed the reducers directly
-			for i, job := range applicableJobs {
-				var res mappingWorkResult
-
-				select {
-				case res = <-jobWorkResult[i]:
-				case err = <-errorChannel:
-					stopNow()
-					return err
-				}
-
-				results, resultErr := res.results, res.err
-
-				if resultErr != nil {
-					err = resultErr
-					stopNow()
-					return err
-				}
-
-				if len(results) > 1 && job.Sorter != nil {
-					sort.Sort(&resultSorter{results, job.Sorter})
-				}
-
-				if job.Reducer != nil {
-					reducerInputs[job.jobIndex] <- results
-				}
-
-			}
 		}
 	}
 
-	return err
+	inputDone = true
+	close(fileOpenRequests)
+	go shutdown()
+
+	// Note, once we don't block on every reduce at this point,
+	// we will have to be very careful about deadlocks between Wait()
+	// and sending to the error channels on Reducers etc.
+
+	select {
+	case <-done:
+		return nil
+	case err = <-errorChannel:
+		stopNow()
+		return err
+	}
 }
 
 type fileOpenRequest struct {
@@ -189,7 +178,6 @@ func fileOpener(
 	errChan chan<- error,
 	stop <-chan struct{},
 	fileWaitGroup *sync.WaitGroup,
-	mapperWaitGroup *sync.WaitGroup,
 ) {
 	defer fileWaitGroup.Done()
 
@@ -200,7 +188,7 @@ func fileOpener(
 			select {
 			case <-stop:
 				return
-			case errChan <- err:
+			case errChan <- &fileOpenError{path: i.path, err: err}:
 				return
 			}
 		}
@@ -208,7 +196,6 @@ func fileOpener(
 		for _, work := range i.work {
 			work.content = content
 
-			// don't block in case stopped
 			select {
 			case <-stop:
 				return
@@ -225,10 +212,11 @@ type mappingWorkResult struct {
 }
 
 type mappingWork struct {
-	m       Mapper
-	path    string
-	content []byte
-	result  chan<- mappingWorkResult
+	m         Mapper
+	path      string
+	content   []byte
+	result    chan<- []MapResult
+	errorChan chan<- error
 }
 
 func mappingApplier(
@@ -240,51 +228,70 @@ func mappingApplier(
 
 	for work := range workChan {
 		r, err := work.m.Map(work.path, work.content)
+
+		resultChan := work.result
+		errChan := (chan<- error)(nil)
+
+		if err != nil {
+			errChan = work.errorChan
+			resultChan = nil
+		}
+
 		select {
 		case <-stop:
 			return
-		case work.result <- mappingWorkResult{r, err}:
+		case resultChan <- r:
+		case errChan <- err:
+			return
 		}
 	}
 }
 
-type folderToMap struct {
-	Jobs Jobs
-	Path string
-}
+func aggregator(
+	results <-chan []MapResult,
+	batchSize int,
+	reducer chan<- []MapResult,
+	cancel <-chan struct{},
+	sorter Sorter,
+	aggregatorWaitGroup *sync.WaitGroup,
+) {
+	defer aggregatorWaitGroup.Done()
 
-type workRemaining []folderToMap
+	resultsBatch := make([]MapResult, 0, batchSize)
+	for resultGroup := range results {
+		if batchSize == 0 {
+			select {
+			case <-cancel:
+				return
+			case reducer <- resultGroup:
+			}
+		} else if len(resultsBatch)+len(resultGroup) >= batchSize {
+			take := batchSize - len(resultsBatch)
+			resultsBatch = append(resultsBatch, resultGroup[0:take]...)
 
-func (w *workRemaining) Done() bool {
-	return len(*w) == 0
-}
+			if sorter != nil {
+				sort.Sort(&resultSorter{resultsBatch, sorter})
+			}
 
-func (w *workRemaining) Add(r folderToMap) {
-	*w = append(*w, r)
-}
-
-func (w *workRemaining) Pop() (folderToMap, bool) {
-	if len(*w) == 0 {
-		return folderToMap{}, false
-	}
-
-	popped := (*w)[len(*w)-1]
-	*w = (*w)[0 : len(*w)-1]
-	return popped, true
-}
-
-func addSubfoldersToRemainingWork(work *workRemaining, currentFolder folderToMap, folders []string) {
-	for _, folder := range folders {
-		subfolder := joinWithSlash(currentFolder.Path, folder)
-		potentialJobsForSubfolder := currentFolder.Jobs.Potential(subfolder)
-
-		if len(potentialJobsForSubfolder) > 0 {
-			work.Add(folderToMap{
-				potentialJobsForSubfolder,
-				subfolder,
-			})
+			select {
+			case <-cancel:
+				return
+			case reducer <- resultsBatch:
+				resultsBatch = make([]MapResult, 0, batchSize)
+				resultsBatch = append(resultsBatch, resultGroup[take:len(resultGroup)]...)
+			}
+		} else {
+			resultsBatch = append(resultsBatch, resultGroup...)
 		}
 	}
+
+	// send remaining
+	select {
+	case <-cancel:
+		return
+	case reducer <- resultsBatch:
+	}
+
 }
 
 func startReducers(
@@ -341,73 +348,9 @@ func reduceAndFinalize(
 	wg.Done()
 }
 
-// Jobs are a list of Jobs
-type Jobs []Job
-
-// Names returns a list of Job names
-func (j Jobs) Names() []string {
-	n := make([]string, len(j))
-	for i, job := range j {
-		n[i] = job.Name
-	}
-	return n
-}
-
-// Potential returns the list of jobs that could potentially match a path
-func (j Jobs) Potential(path string) Jobs {
-	results := make(Jobs, 0, len(j))
-	for _, job := range j {
-		if job.Filter.CouldMatch(path) {
-			results = append(results, job)
-		}
-	}
-	return results
-}
-
-// Matches returns the jobs that match a path
-func (j Jobs) Matches(path string) Jobs {
-	results := make(Jobs, 0, len(j))
-	for _, job := range j {
-		if job.Filter.Match(path) {
-			results = append(results, job)
-		}
-	}
-	return results
-}
-
 func joinWithSlash(p ...string) string {
 	joined := filepath.Join(p...)
 	return filepath.ToSlash(joined)
-}
-
-type mappingError struct {
-	path string
-	job  string
-	err  error
-}
-
-func (err *mappingError) Error() string {
-	return fmt.Sprintf(
-		"Error mapping content of file \"%v\" for \"%v\": %v",
-		err.path,
-		err.job,
-		err.err,
-	)
-}
-
-type fileOpenError struct {
-	path string
-	jobs []string
-	err  error
-}
-
-func (err *fileOpenError) Error() string {
-	return fmt.Sprintf(
-		"Error opening file \"%v\" for \"%v\": %v",
-		err.path,
-		err.jobs,
-		err.err,
-	)
 }
 
 // Sorts results based on the sorter
@@ -426,4 +369,16 @@ func (rs *resultSorter) Swap(i, j int) {
 
 func (rs *resultSorter) Less(i, j int) bool {
 	return rs.Sorter.Less(&rs.results[i], &rs.results[j])
+}
+
+type once struct {
+	done bool
+	f    func()
+}
+
+func (o *once) Do() {
+	if !o.done {
+		o.done = true
+		o.f()
+	}
 }
