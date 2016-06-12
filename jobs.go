@@ -10,6 +10,7 @@ type Job struct {
 	Name      string
 	BatchSize int
 	Filter
+	DirectoryFiles Filter
 	Mapper
 	Sorter
 	Reducer

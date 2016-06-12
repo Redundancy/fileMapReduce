@@ -182,6 +182,8 @@ func fileOpener(
 	defer fileWaitGroup.Done()
 
 	for i := range inputChan {
+
+		var err error
 		content, err := fs.Open(i.path)
 
 		if err != nil {
@@ -214,7 +216,7 @@ type mappingWorkResult struct {
 type mappingWork struct {
 	m         Mapper
 	path      string
-	content   []byte
+	content   interface{}
 	result    chan<- []MapResult
 	errorChan chan<- error
 }
@@ -227,7 +229,7 @@ func mappingApplier(
 	defer waiter.Done()
 
 	for work := range workChan {
-		r, err := work.m.Map(work.path, work.content)
+		r, err := work.m.Map(work.path, nil, work.content)
 
 		resultChan := work.result
 		errChan := (chan<- error)(nil)

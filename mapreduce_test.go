@@ -2,8 +2,11 @@ package mapreduce
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"sort"
 	"strconv"
 	"strings"
@@ -54,7 +57,7 @@ func TestMapper(t *testing.T) {
 	fs := &FS{Root: "testFixtures"}
 	mapped := make([]string, 0, 4)
 
-	var f1 FunctionMapper = func(path string, data []byte) ([]MapResult, error) {
+	var f1 FunctionMapper = func(path string, parents []interface{}, data interface{}) ([]MapResult, error) {
 		mapped = append(mapped, path)
 		return nil, nil
 	}
@@ -92,7 +95,7 @@ func singleResult(r interface{}) []MapResult {
 	return []MapResult{MapResult{Result: r}}
 }
 
-var nilMapper = func(path string, data []byte) ([]MapResult, error) {
+var nilMapper = func(path string, parents []interface{}, data interface{}) ([]MapResult, error) {
 	return singleResult(nil), nil
 }
 
@@ -103,8 +106,8 @@ var nilFinalizer = func(result interface{}) error {
 func TestLineCounter(t *testing.T) {
 	fs := &FS{Root: "testFixtures"}
 
-	var m FunctionMapper = func(path string, data []byte) ([]MapResult, error) {
-		newlineCount := bytes.Count(data, []byte{'\n'})
+	var m FunctionMapper = func(path string, parents []interface{}, data interface{}) ([]MapResult, error) {
+		newlineCount := bytes.Count(data.([]byte), []byte{'\n'})
 		return singleResult(newlineCount), nil
 	}
 
@@ -136,8 +139,8 @@ func TestLineCounter(t *testing.T) {
 func TestLineSum(t *testing.T) {
 	fs := &FS{Root: "testFixtures"}
 
-	var m FunctionMapper = func(path string, data []byte) ([]MapResult, error) {
-		buf := bytes.NewBuffer(data)
+	var m FunctionMapper = func(path string, parents []interface{}, data interface{}) ([]MapResult, error) {
+		buf := bytes.NewBuffer(data.([]byte))
 		results := make([]MapResult, 0, 5)
 
 		for {
@@ -185,14 +188,14 @@ type FSError struct {
 
 var errfileSystemOpenFailed = errors.New("TEST FAIL")
 
-func (f *FSError) Open(path string) (contents []byte, err error) {
+func (f *FSError) Open(path string) (contents interface{}, err error) {
 	return nil, errfileSystemOpenFailed
 }
 
 func TestFileSystemError(t *testing.T) {
 	fs := &FSError{FS{Root: "testFixtures"}}
 
-	var m FunctionMapper = func(path string, data []byte) ([]MapResult, error) {
+	var m FunctionMapper = func(path string, parents []interface{}, data interface{}) ([]MapResult, error) {
 		return singleResult(nil), nil
 	}
 
@@ -220,7 +223,7 @@ var errMapper = errors.New("TEST FAIL: errMapper")
 func TestMapperError(t *testing.T) {
 	fs := &FS{Root: "testFixtures"}
 
-	var m FunctionMapper = func(path string, data []byte) ([]MapResult, error) {
+	var m FunctionMapper = func(path string, parents []interface{}, data interface{}) ([]MapResult, error) {
 		return singleResult(nil), errMapper
 	}
 
@@ -273,7 +276,7 @@ func TestReducerError(t *testing.T) {
 func TestSortedReduction(t *testing.T) {
 	fs := &FS{Root: "testFixtures"}
 
-	var m FunctionMapper = func(path string, data []byte) ([]MapResult, error) {
+	var m FunctionMapper = func(path string, parents []interface{}, data interface{}) ([]MapResult, error) {
 		return []MapResult{
 			MapResult{Key: 3},
 			MapResult{Key: 1},
@@ -310,10 +313,10 @@ func TestSortedReduction(t *testing.T) {
 }
 
 func TestBatching(t *testing.T) {
-	fs := &FS{Root: "testFixtures"}
+	fs := &FS{Root: "testFixtures/a"}
 
 	// invoked three times (9 results)
-	var m FunctionMapper = func(path string, data []byte) ([]MapResult, error) {
+	var m FunctionMapper = func(path string, parents []interface{}, data interface{}) ([]MapResult, error) {
 		return []MapResult{
 			MapResult{Key: 3},
 			MapResult{Key: 1},
@@ -345,6 +348,50 @@ func TestBatching(t *testing.T) {
 			Sorter:    SimpleLess,
 			Reducer:   r,
 			Finalizer: f,
+		},
+	})
+
+	if err != nil {
+		t.Error(err)
+	}
+}
+
+type datatype struct {
+	Value int `json:"value"`
+}
+
+func TestLoaderFiles(t *testing.T) {
+	fs := &FS{
+		Root: "testFixtures/json",
+		Loader: func(path string, r io.Reader) (loaded interface{}, err error) {
+			data, err := ioutil.ReadAll(r)
+
+			if err != nil {
+				return nil, err
+			}
+
+			loaded = &datatype{}
+			err = json.Unmarshal(data, &loaded)
+			return loaded, err
+		},
+	}
+
+	var m FunctionMapper = func(path string, parents []interface{}, data interface{}) ([]MapResult, error) {
+		c, ok := data.(*datatype)
+		if !ok {
+			t.Errorf("loaded data was not as expected: %#v", data)
+		}
+		if c.Value != 3 {
+			t.Errorf("Unexpected value: %v", c)
+		}
+		return nil, nil
+	}
+
+	err := MapReduce(fs, []Job{
+		Job{
+			Name:   "TestDir",
+			Filter: PathFilter("*/*.json"),
+			Mapper: m,
 		},
 	})
 

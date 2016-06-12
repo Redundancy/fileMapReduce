@@ -9,17 +9,44 @@ type Filter interface {
 	Match(string) bool
 }
 
+// MultiFilter provides a mechanism for combining filters such that any may match
+type MultiFilter []Filter
+
+// CouldMatch implements Filter.CouldMatch
+func (m MultiFilter) CouldMatch(p string) bool {
+	for _, f := range m {
+		if f.CouldMatch(p) {
+			return true
+		}
+	}
+	return false
+}
+
+// Match implements Filter.Match
+func (m MultiFilter) Match(p string) bool {
+	for _, f := range m {
+		if f.Match(p) {
+			return true
+		}
+	}
+	return false
+}
+
 // Mapper provides an interface to execute map operations on files
+// parents is a slice of the contents of directory files from folders above the path
+//
+// The objects provided in the parents and data parameters must not be modified by the Map function
+// since they are potentially in use within multiple mappers simultaneoussly
 type Mapper interface {
-	Map(path string, data []byte) ([]MapResult, error)
+	Map(path string, parents []interface{}, data interface{}) ([]MapResult, error)
 }
 
 // FunctionMapper implements the Mapper interface with a simple function
-type FunctionMapper func(path string, data []byte) ([]MapResult, error)
+type FunctionMapper func(path string, parents []interface{}, data interface{}) ([]MapResult, error)
 
 // Map implements Mapper.Map
-func (f FunctionMapper) Map(path string, data []byte) ([]MapResult, error) {
-	return f(path, data)
+func (f FunctionMapper) Map(path string, parents []interface{}, data interface{}) ([]MapResult, error) {
+	return f(path, parents, data)
 }
 
 // Sorter (if provided as part of a Job) will ensure that each invocation of
@@ -83,6 +110,8 @@ type MapResult struct {
 
 // FileSystem implements a simple disk-based file system interface
 type FileSystem interface {
+	// List the folders and files under a path
 	List(path string) (folders []string, files []string, err error)
-	Open(path string) (contents []byte, err error)
+	// Open a file - the contents can be anything that a Map function will accept
+	Open(path string) (contents interface{}, err error)
 }

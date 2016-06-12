@@ -7,6 +7,11 @@ type folderToMap struct {
 	Jobs Jobs
 }
 
+type jobAndDirectoryStack struct {
+	Job
+	stack [][]byte
+}
+
 type workRemaining []folderToMap
 
 func (w *workRemaining) Done() bool {
