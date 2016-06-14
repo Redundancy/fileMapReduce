@@ -10,14 +10,14 @@ import (
 // MapReduce takes a list of Jobs and executes them concurrently on
 // a FileSystem
 func MapReduce(filesystem FileSystem, jobs Jobs) (err error) {
-	foldersRemaining := &workRemaining{}
-	foldersRemaining.Add(folderToMap{Path: "", Jobs: jobs})
-
 	jobWorkResult := make([]chan []MapResult, len(jobs))
 	for i := range jobs {
 		jobs[i].jobIndex = i
 		jobWorkResult[i] = make(chan []MapResult)
 	}
+
+	foldersRemaining := &workRemaining{}
+	foldersRemaining.Add(folderToMap{Path: "", jobsAndStack: newStack(jobs)})
 
 	// stop is the gordian knot used to break all deadlocks
 	// all sends are done as selects against this channel, allowing them to
@@ -29,6 +29,7 @@ func MapReduce(filesystem FileSystem, jobs Jobs) (err error) {
 	// All blocking sends and receives on the main channel must listen to the
 	// error channel. Only the first error is received from it
 	errorChannel := make(chan error)
+	directoryOpenResultChan := make(chan directoryFileOpenResult)
 
 	ioWaitGroup := sync.WaitGroup{}
 	mapperWaitGroup := sync.WaitGroup{}
@@ -112,41 +113,71 @@ func MapReduce(filesystem FileSystem, jobs Jobs) (err error) {
 	defer shutdown()
 	for !foldersRemaining.Done() {
 		currentFolder, _ := foldersRemaining.Pop()
+		//fmt.Println("current", currentFolder)
 		folders, files, listErr := filesystem.List(currentFolder.Path)
+		jobIndexes := make([]int, 0, len(currentFolder.jobsAndStack))
+		directoryFiles := 0
 
 		if listErr != nil {
 			return listErr
 		}
 
-		foldersRemaining.addSubfoldersToRemainingWork(
-			currentFolder,
-			folders,
-		)
-
-	FileMapping:
 		for _, filename := range files {
 			fullpath := joinWithSlash(currentFolder.Path, filename)
-			applicableJobs := currentFolder.Jobs.Matches(fullpath)
+			applicableJobs := currentFolder.Matches(fullpath)
+			var directoryResultChan chan directoryFileOpenResult
 
-			if len(applicableJobs) == 0 {
-				continue FileMapping
+			for _, stack := range currentFolder.jobsAndStack {
+				if stack.Job.DirectoryFiles != nil && stack.Job.DirectoryFiles.Match(fullpath) {
+					directoryFiles++
+					jobIndexes = append(jobIndexes, stack.Job.jobIndex)
+					directoryResultChan = directoryOpenResultChan
+					break
+				}
 			}
 
 			mappers := make([]mappingWork, len(applicableJobs))
 			for i, job := range applicableJobs {
 				mappers[i] = mappingWork{
-					m:         job,
+					m:         job.Job,
 					path:      fullpath,
+					parents:   job.stack,
 					result:    jobWorkResult[i],
 					errorChan: errorChannel,
 				}
 			}
 
-			fileOpenRequests <- fileOpenRequest{
-				path: fullpath,
-				work: mappers,
+			if len(applicableJobs) > 0 || len(jobIndexes) > 0 {
+				fileOpenRequests <- fileOpenRequest{
+					path:                     fullpath,
+					jobIndexes:               jobIndexes,
+					directoryFileRequestChan: directoryResultChan,
+					work: mappers,
+				}
 			}
 		}
+
+		var directoryFileMap map[int]interface{}
+		if directoryFiles > 0 {
+			directoryFileMap = make(map[int]interface{})
+			for i := 0; i < directoryFiles; i++ {
+				select {
+				case result := <-directoryOpenResultChan:
+					for _, jobIndex := range result.jobs {
+						directoryFileMap[jobIndex] = result.loaded
+					}
+				case err = <-errorChannel:
+					stopNow()
+					return err
+				}
+			}
+		}
+
+		foldersRemaining.addSubfoldersToRemainingWork(
+			currentFolder,
+			folders,
+			directoryFileMap,
+		)
 	}
 
 	inputDone = true
@@ -167,8 +198,10 @@ func MapReduce(filesystem FileSystem, jobs Jobs) (err error) {
 }
 
 type fileOpenRequest struct {
-	path string
-	work []mappingWork
+	path                     string
+	work                     []mappingWork
+	jobIndexes               []int
+	directoryFileRequestChan chan<- directoryFileOpenResult
 }
 
 func fileOpener(
@@ -195,6 +228,14 @@ func fileOpener(
 			}
 		}
 
+		if i.directoryFileRequestChan != nil {
+			select {
+			case <-stop:
+				return
+			case i.directoryFileRequestChan <- directoryFileOpenResult{jobs: i.jobIndexes, loaded: content}:
+			}
+		}
+
 		for _, work := range i.work {
 			work.content = content
 
@@ -213,9 +254,15 @@ type mappingWorkResult struct {
 	err     error
 }
 
+type directoryFileOpenResult struct {
+	jobs   []int
+	loaded interface{}
+}
+
 type mappingWork struct {
 	m         Mapper
 	path      string
+	parents   []interface{}
 	content   interface{}
 	result    chan<- []MapResult
 	errorChan chan<- error
@@ -229,7 +276,7 @@ func mappingApplier(
 	defer waiter.Done()
 
 	for work := range workChan {
-		r, err := work.m.Map(work.path, nil, work.content)
+		r, err := work.m.Map(work.path, work.parents, work.content)
 
 		resultChan := work.result
 		errChan := (chan<- error)(nil)

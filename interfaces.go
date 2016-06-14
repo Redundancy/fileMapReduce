@@ -9,29 +9,6 @@ type Filter interface {
 	Match(string) bool
 }
 
-// MultiFilter provides a mechanism for combining filters such that any may match
-type MultiFilter []Filter
-
-// CouldMatch implements Filter.CouldMatch
-func (m MultiFilter) CouldMatch(p string) bool {
-	for _, f := range m {
-		if f.CouldMatch(p) {
-			return true
-		}
-	}
-	return false
-}
-
-// Match implements Filter.Match
-func (m MultiFilter) Match(p string) bool {
-	for _, f := range m {
-		if f.Match(p) {
-			return true
-		}
-	}
-	return false
-}
-
 // Mapper provides an interface to execute map operations on files
 // parents is a slice of the contents of directory files from folders above the path
 //

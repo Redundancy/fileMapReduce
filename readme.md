@@ -42,6 +42,7 @@ In development (at my own pace). APIs are likely to change and code is going to 
 - [ ] Streaming finalization - finalize with a stream of incrementally loaded data
 - [ ] Improve how reduce is applied (batch sizes?)
 - [ ] Clear rules for reduction - are we aiming for a single stateful reducer or are we potentially distributing reduction work to multiple cores?
-- [ ] Pipeline file loading (more than one load happening at once). Is this needed / faster if the map and reduce functions are on other threads?
-- [ ] Loader - transform inputs before they are passed to mapping functions (eg.  msgpack for lower cost marshalling / unmarshalling)
-- [ ] Messaging support (eg NATS) for distributing workloads?
+- [x] Loading of parents based on directory file filters
+- [x] Pipeline file loading (more than one load happening at once). Is this needed / faster if the map and reduce functions are on other threads?
+- [x] Loader - transform inputs before they are passed to mapping functions (eg.  msgpack for lower cost marshalling / unmarshalling)
+- [ ] (Low) Messaging support (eg NATS) for distributing workloads?

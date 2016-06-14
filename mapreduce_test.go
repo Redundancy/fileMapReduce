@@ -360,22 +360,22 @@ type datatype struct {
 	Value int `json:"value"`
 }
 
-func TestLoaderFiles(t *testing.T) {
-	fs := &FS{
-		Root: "testFixtures/json",
-		Loader: func(path string, r io.Reader) (loaded interface{}, err error) {
-			data, err := ioutil.ReadAll(r)
+var jsonFileSystem = &FS{
+	Root: "testFixtures/json",
+	Loader: func(path string, r io.Reader) (loaded interface{}, err error) {
+		data, err := ioutil.ReadAll(r)
 
-			if err != nil {
-				return nil, err
-			}
+		if err != nil {
+			return nil, err
+		}
 
-			loaded = &datatype{}
-			err = json.Unmarshal(data, &loaded)
-			return loaded, err
-		},
-	}
+		loaded = &datatype{}
+		err = json.Unmarshal(data, &loaded)
+		return loaded, err
+	},
+}
 
+func TestLoader(t *testing.T) {
 	var m FunctionMapper = func(path string, parents []interface{}, data interface{}) ([]MapResult, error) {
 		c, ok := data.(*datatype)
 		if !ok {
@@ -387,7 +387,7 @@ func TestLoaderFiles(t *testing.T) {
 		return nil, nil
 	}
 
-	err := MapReduce(fs, []Job{
+	err := MapReduce(jsonFileSystem, []Job{
 		Job{
 			Name:   "TestDir",
 			Filter: PathFilter("*/*.json"),
@@ -398,4 +398,178 @@ func TestLoaderFiles(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
+}
+
+func TestDirectoryFiles(t *testing.T) {
+	var m FunctionMapper = func(path string, parents []interface{}, data interface{}) ([]MapResult, error) {
+		item := data.(*datatype)
+		if len(parents) != 1 {
+			return nil, fmt.Errorf("No parents in mapper!")
+		}
+		parent := parents[0].(*datatype)
+		result := item.Value * parent.Value
+		if result != 6 {
+			t.Errorf("Wrong result! %v * %v", item, parents[0])
+		}
+		return singleResult(item.Value * parent.Value), nil
+	}
+
+	err := MapReduce(jsonFileSystem, []Job{
+		Job{
+			Name:           "TestDir",
+			Filter:         PathFilter("*/*.json"),
+			DirectoryFiles: PathFilter("*.json"),
+			Mapper:         m,
+		},
+	})
+
+	if err != nil {
+		t.Error(err)
+	}
+}
+
+func TestMultipleDirectoryFiles(t *testing.T) {
+	fs := StaticVirtualFileSystem{
+		"folder/folder/folder/map.txt": "map content",
+		"folder/folder/file.txt":       "content",
+		"folder/file.txt":              "more content",
+		"file.txt":                     "even more content",
+	}
+
+	var m FunctionMapper = func(path string, parents []interface{}, data interface{}) ([]MapResult, error) {
+		if len(parents) != 3 {
+			t.Errorf("Unexpected number of parent files: %v", parents)
+		}
+		return nil, nil
+	}
+
+	err := MapReduce(fs, []Job{
+		Job{
+			Name:   "TestMultipleDirectoryFiles",
+			Filter: PathFilter("**/map.txt"),
+			DirectoryFiles: MultiFilter{
+				PathFilter("file.txt"),
+				PathFilter("**/file.txt"),
+			},
+			Mapper: m,
+		},
+	})
+
+	if err != nil {
+		t.Error(err)
+	}
+}
+
+func TestDirectoryFilesWithMultipleJobs(t *testing.T) {
+	fs := StaticVirtualFileSystem{
+		"folder/folder/folder/map.txt": "map content",
+		"folder/folder/file.txt":       "content",
+		"folder/file.txt":              "more content",
+		"file.txt":                     "even more content",
+	}
+
+	var m1 FunctionMapper = func(path string, parents []interface{}, data interface{}) ([]MapResult, error) {
+		if len(parents) != 2 {
+			t.Errorf("Unexpected number of parent files: %#v", parents)
+		}
+		return nil, nil
+	}
+
+	var m2 FunctionMapper = func(path string, parents []interface{}, data interface{}) ([]MapResult, error) {
+		if len(parents) != 1 {
+			t.Errorf("Unexpected number of parent files: %#v", parents)
+		}
+		return nil, nil
+	}
+
+	err := MapReduce(fs, []Job{
+		Job{
+			Name:           "TesDirectoryFilesWithMultipleJobs-2",
+			Filter:         PathFilter("**/map.txt"),
+			DirectoryFiles: PathFilter("file.txt"),
+			Mapper:         m2,
+		},
+		Job{
+			Name:           "TesDirectoryFilesWithMultipleJobs-1",
+			Filter:         PathFilter("**/map.txt"),
+			DirectoryFiles: PathFilter("**/file.txt"),
+			Mapper:         m1,
+		},
+	})
+
+	if err != nil {
+		t.Error(err)
+	}
+}
+
+type jsonLoader StaticVirtualFileSystem
+
+// List the folders and files under a path
+func (s jsonLoader) List(path string) (folders []string, files []string, err error) {
+	return StaticVirtualFileSystem(s).List(path)
+}
+
+func (s jsonLoader) Open(path string) (contents interface{}, err error) {
+	c, err := StaticVirtualFileSystem(s).Open(path)
+
+	if err != nil {
+		return nil, err
+	}
+
+	loaded := &datatype{}
+	data := ([]byte)(c.(string))
+	err = json.Unmarshal(data, &loaded)
+	return loaded, err
+}
+
+func ExampleMapReduce() {
+	fs := StaticVirtualFileSystem{
+		"file.txt":           "irrelevant file",
+		"parent.json":        "{\"value\":2}",
+		"folder/child.json":  "{\"value\":3}",
+		"folder/child2.json": "{\"value\":4}",
+	}
+
+	var multiplyByParent FunctionMapper = func(path string, parents []interface{}, data interface{}) ([]MapResult, error) {
+		item := data.(*datatype)
+		parent := parents[0].(*datatype)
+		return singleResult(item.Value * parent.Value), nil
+	}
+
+	var sum FunctionReducer = func(current interface{}, stream chan []MapResult) (result interface{}, err error) {
+		i := 0
+		if current != nil {
+			i = current.(int)
+		}
+
+		for items := range stream {
+			for _, result := range items {
+				i += result.Result.(int)
+			}
+		}
+		return i, nil
+	}
+
+	var printResult FunctionFinalizer = func(result interface{}) error {
+		fmt.Printf("Sum of Children*Parent: %v", result)
+		return nil
+	}
+
+	err := MapReduce(jsonLoader(fs), []Job{
+		Job{
+			Name:           "Example-Sum(Child*Parent)",
+			Filter:         PathFilter("*/*.json"),
+			DirectoryFiles: PathFilter("*.json"),
+			Mapper:         multiplyByParent,
+			Reducer:        sum,
+			Finalizer:      printResult,
+		},
+	})
+
+	if err != nil {
+		fmt.Println("Error:", err)
+	}
+
+	// Output:
+	// Sum of Children*Parent: 14
 }

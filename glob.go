@@ -6,6 +6,29 @@ import (
 	"strings"
 )
 
+// MultiFilter provides a mechanism for combining filters such that any may match
+type MultiFilter []Filter
+
+// CouldMatch implements Filter.CouldMatch
+func (m MultiFilter) CouldMatch(p string) bool {
+	for _, f := range m {
+		if f.CouldMatch(p) {
+			return true
+		}
+	}
+	return false
+}
+
+// Match implements Filter.Match
+func (m MultiFilter) Match(p string) bool {
+	for _, f := range m {
+		if f.Match(p) {
+			return true
+		}
+	}
+	return false
+}
+
 // PathFilter implements a basic glob-like filter based on paths
 // It uses ** as a recursive directory filter and * as a wildcard
 // * may be used partially (eg. *.json) but ** may not
