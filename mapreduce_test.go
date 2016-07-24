@@ -502,6 +502,34 @@ func TestDirectoryFilesWithMultipleJobs(t *testing.T) {
 	}
 }
 
+func buildLargeFileMap(items int) map[string]interface{} {
+	result := map[string]interface{}{}
+	for i := 0; i < items; i++ {
+		result[fmt.Sprint(i)] = "filecontent"
+	}
+	return result
+}
+
+func TestMappingLargeNumberOfItems(t *testing.T) {
+	fs := StaticVirtualFileSystem(buildLargeFileMap(1000))
+
+	var m1 FunctionMapper = func(path string, parents []interface{}, data interface{}) ([]MapResult, error) {
+		return nil, nil
+	}
+
+	err := MapReduce(fs, []Job{
+		Job{
+			Name:   "TestLargeMap",
+			Filter: PathFilter("**"),
+			Mapper: m1,
+		},
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 type jsonLoader StaticVirtualFileSystem
 
 // List the folders and files under a path

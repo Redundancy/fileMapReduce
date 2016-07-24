@@ -10,10 +10,10 @@ import (
 // MapReduce takes a list of Jobs and executes them concurrently on
 // a FileSystem
 func MapReduce(filesystem FileSystem, jobs Jobs) (err error) {
-	jobWorkResult := make([]chan []MapResult, len(jobs))
+	aggregatorInputs := make([]chan []MapResult, len(jobs))
 	for i := range jobs {
 		jobs[i].jobIndex = i
-		jobWorkResult[i] = make(chan []MapResult)
+		aggregatorInputs[i] = make(chan []MapResult)
 	}
 
 	foldersRemaining := &workRemaining{}
@@ -25,7 +25,7 @@ func MapReduce(filesystem FileSystem, jobs Jobs) (err error) {
 	stop := make(chan struct{})
 	stopNow := (&once{f: func() { close(stop) }}).Do
 
-	defer stopNow()
+	//defer stopNow()
 	// All blocking sends and receives on the main channel must listen to the
 	// error channel. Only the first error is received from it
 	errorChannel := make(chan error)
@@ -50,32 +50,46 @@ func MapReduce(filesystem FileSystem, jobs Jobs) (err error) {
 	mapperWaitGroup.Add(numCPU)
 
 	for i := 0; i < numCPU; i++ {
-		go fileOpener(
-			filesystem,
-			fileOpenRequests,
-			mapperInput,
-			errorChannel,
-			stop,
-			&ioWaitGroup,
-		)
+		go func() {
+			fileOpener(
+				filesystem,
+				fileOpenRequests,
+				mapperInput,
+				errorChannel,
+				stop,
+			)
+			ioWaitGroup.Done()
+		}()
 
-		go mappingApplier(
-			mapperInput,
-			stop,
-			&mapperWaitGroup,
-		)
+		go func() {
+			mappingApplier(
+				mapperInput,
+				stop,
+			)
+			mapperWaitGroup.Done()
+		}()
 	}
 
-	for _, job := range jobs {
+	for _, jobIt := range jobs {
 		aggregatorWaitGroup.Add(1)
-		go aggregator(
-			jobWorkResult[job.jobIndex],
-			job.BatchSize,
-			reducerInputs[job.jobIndex],
-			stop,
-			job.Sorter,
-			&aggregatorWaitGroup,
-		)
+		job := jobIt
+		go func() {
+			if job.Reducer == nil {
+				discardingAggregator(
+					aggregatorInputs[job.jobIndex],
+					stop,
+				)
+			} else {
+				aggregator(
+					aggregatorInputs[job.jobIndex],
+					job.BatchSize,
+					reducerInputs[job.jobIndex],
+					stop,
+					job.Sorter,
+				)
+			}
+			aggregatorWaitGroup.Done()
+		}()
 	}
 
 	inputDone := false
@@ -95,44 +109,53 @@ func MapReduce(filesystem FileSystem, jobs Jobs) (err error) {
 		mapperWaitGroup.Wait()
 		// mappers done feeding aggregators
 
-		for _, d := range jobWorkResult {
-			close(d)
+		for _, d := range aggregatorInputs {
+			if d != nil {
+				close(d)
+			}
 		}
 
 		aggregatorWaitGroup.Wait()
 		// aggregators done feeding reducers
 
 		for _, d := range reducerInputs {
-			close(d)
+			if d != nil {
+				close(d)
+			}
 		}
 
 		reducerWaitGroup.Wait()
 		close(done)
 	}}).Do
 
+	directoryTracker := &jobTracker{}
 	defer shutdown()
+
+	// If we exit early due to an error, teardown before
+	// shutdown, since we cannot wait for things to finish normally
+	defer func() {
+		if err != nil {
+			stopNow()
+		}
+	}()
+
 	for !foldersRemaining.Done() {
 		currentFolder, _ := foldersRemaining.Pop()
-		//fmt.Println("current", currentFolder)
 		folders, files, listErr := filesystem.List(currentFolder.Path)
-		jobIndexes := make([]int, 0, len(currentFolder.jobsAndStack))
-		directoryFiles := 0
+		directoryFilesInFolderCount := 0
 
-		if listErr != nil {
-			return listErr
+		err = listErr
+		if err != nil {
+			return err
 		}
 
 		for _, filename := range files {
 			fullpath := joinWithSlash(currentFolder.Path, filename)
 			applicableJobs := currentFolder.Matches(fullpath)
-			var directoryResultChan chan directoryFileOpenResult
 
 			for _, stack := range currentFolder.jobsAndStack {
 				if stack.Job.DirectoryFiles != nil && stack.Job.DirectoryFiles.Match(fullpath) {
-					directoryFiles++
-					jobIndexes = append(jobIndexes, stack.Job.jobIndex)
-					directoryResultChan = directoryOpenResultChan
-					break
+					directoryTracker.addJob(stack.Job.jobIndex)
 				}
 			}
 
@@ -142,34 +165,35 @@ func MapReduce(filesystem FileSystem, jobs Jobs) (err error) {
 					m:         job.Job,
 					path:      fullpath,
 					parents:   job.stack,
-					result:    jobWorkResult[i],
+					result:    aggregatorInputs[i],
 					errorChan: errorChannel,
 				}
 			}
 
-			if len(applicableJobs) > 0 || len(jobIndexes) > 0 {
+			if directoryTracker.count() > 0 {
+				directoryFilesInFolderCount++
+			}
+			if len(applicableJobs) > 0 || directoryTracker.count() > 0 {
 				fileOpenRequests <- fileOpenRequest{
-					path:                     fullpath,
-					jobIndexes:               jobIndexes,
-					directoryFileRequestChan: directoryResultChan,
-					work: mappers,
+					path: fullpath,
+					// The order is important here, since takeJobIndicesForFile will modify the directoryTracker
+					directoryFileRequestChan: directoryTracker.getChannelIfLoadingDirectoryFile(directoryOpenResultChan),
+					jobIndexes:               directoryTracker.takeJobIndicesForFile(),
+					work:                     mappers,
 				}
 			}
 		}
 
-		var directoryFileMap map[int]interface{}
-		if directoryFiles > 0 {
-			directoryFileMap = make(map[int]interface{})
-			for i := 0; i < directoryFiles; i++ {
-				select {
-				case result := <-directoryOpenResultChan:
-					for _, jobIndex := range result.jobs {
-						directoryFileMap[jobIndex] = result.loaded
-					}
-				case err = <-errorChannel:
-					stopNow()
-					return err
+		directoryFileMap := map[int]interface{}{}
+
+		for i := 0; i < directoryFilesInFolderCount; i++ {
+			select {
+			case result := <-directoryOpenResultChan:
+				for _, jobIndex := range result.jobs {
+					directoryFileMap[jobIndex] = result.loaded
 				}
+			case err = <-errorChannel:
+				return err
 			}
 		}
 
@@ -182,19 +206,46 @@ func MapReduce(filesystem FileSystem, jobs Jobs) (err error) {
 
 	inputDone = true
 	close(fileOpenRequests)
+	// start the shutdown in order
 	go shutdown()
 
 	// Note, once we don't block on every reduce at this point,
 	// we will have to be very careful about deadlocks between Wait()
 	// and sending to the error channels on Reducers etc.
-
 	select {
 	case <-done:
 		return nil
 	case err = <-errorChannel:
-		stopNow()
 		return err
 	}
+}
+
+// jobTracker tracks the jobs that use a file for a directory file
+type jobTracker struct {
+	jobs []int
+}
+
+func (j *jobTracker) addJob(jobIndex int) {
+	j.jobs = append(j.jobs, jobIndex)
+}
+
+func (j *jobTracker) count() int {
+	return len(j.jobs)
+}
+
+// gets the slice of job indices and resets
+func (j *jobTracker) takeJobIndicesForFile() []int {
+	t := j.jobs
+	j.jobs = make([]int, 0, 5)
+	return t
+}
+
+// If there are no directory files to be loaded, return nil instead of the channel
+func (j *jobTracker) getChannelIfLoadingDirectoryFile(channel chan directoryFileOpenResult) chan<- directoryFileOpenResult {
+	if len(j.jobs) > 0 {
+		return channel
+	}
+	return nil
 }
 
 type fileOpenRequest struct {
@@ -210,10 +261,7 @@ func fileOpener(
 	outputChan chan<- mappingWork,
 	errChan chan<- error,
 	stop <-chan struct{},
-	fileWaitGroup *sync.WaitGroup,
 ) {
-	defer fileWaitGroup.Done()
-
 	for i := range inputChan {
 
 		var err error
@@ -271,10 +319,7 @@ type mappingWork struct {
 func mappingApplier(
 	workChan chan mappingWork,
 	stop <-chan struct{},
-	waiter *sync.WaitGroup,
 ) {
-	defer waiter.Done()
-
 	for work := range workChan {
 		r, err := work.m.Map(work.path, work.parents, work.content)
 
@@ -296,15 +341,25 @@ func mappingApplier(
 	}
 }
 
+func discardingAggregator(results <-chan []MapResult, cancel <-chan struct{}) {
+	// If there is no reducer channel, just read and discard
+	for range results {
+		select {
+		case <-cancel:
+			return
+		default:
+		}
+	}
+	return
+}
+
 func aggregator(
 	results <-chan []MapResult,
 	batchSize int,
 	reducer chan<- []MapResult,
 	cancel <-chan struct{},
 	sorter Sorter,
-	aggregatorWaitGroup *sync.WaitGroup,
 ) {
-	defer aggregatorWaitGroup.Done()
 
 	resultsBatch := make([]MapResult, 0, batchSize)
 	for resultGroup := range results {
@@ -353,13 +408,14 @@ func startReducers(
 	dispatchers = make([]chan<- []MapResult, len(jobs))
 
 	for i := range jobs {
-		resultChannel := make(chan []MapResult, 5)
-		dispatchers[i] = resultChannel
 
 		job := jobs[i]
 		reducerFunc := job.Reducer
 
 		if reducerFunc != nil {
+			resultChannel := make(chan []MapResult, 5)
+			dispatchers[i] = resultChannel
+
 			wg.Add(1)
 			go reduceAndFinalize(
 				job,
